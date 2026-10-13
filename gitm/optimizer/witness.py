@@ -1324,7 +1324,7 @@ def _manifest_differences(run_dir: Path, ref_dir: Path) -> tuple[list[str], list
             return json.dumps(v, sort_keys=True, default=str)
 
         def scalar(v: Any) -> bool:
-            return v is None or isinstance(v, (str, int, float, bool))
+            return v is None or isinstance(v, str | int | float | bool)
 
         out, identity = [], []
         for k in sorted(mine.keys() & theirs.keys()):
