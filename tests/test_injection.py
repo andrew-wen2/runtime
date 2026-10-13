@@ -601,7 +601,7 @@ def test_gitm_run_leaves_the_start_method_alone_on_nvidia(monkeypatch):
     assert _cli_run_env(monkeypatch, "nvidia") is None
 
 
-@pytest.mark.parametrize("src", ["_cupti/cupti_inject.c"])
+@pytest.mark.parametrize("src", ["_cupti/cupti_inject.c", "_rocm/rocm_inject.c"])
 def test_the_c_collectors_meta_lines_are_the_ones_the_reader_counts(run_env, monkeypatch, src):
     """The C cannot be built here; this at least ties its printed lines to the reader's keys."""
     monkeypatch.setattr(injection, "_pid_alive", lambda pid: False)

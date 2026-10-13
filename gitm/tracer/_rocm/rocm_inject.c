@@ -67,6 +67,8 @@ static char g_arm_path[PATH_MAX];
 static int g_armed = 0;
 static uint64_t g_armed_checked_ms = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Set when a shard write failed; the next count line then says "unknown". */
+static int g_lost = 0;
 
 static rocprofiler_context_id_t g_ctx = {0};    /* buffers + stamps */
 static rocprofiler_context_id_t g_cb_ctx = {0}; /* synchronous callbacks */
@@ -310,9 +312,20 @@ buffer_cb(rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer_id,
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (drop_count > 0)
-        fprintf(g_fp, "{\"kind\":\"meta\",\"dropped_records\":%llu}\n",
-                (unsigned long long)drop_count);
+    /* LOSSLESS should keep this at zero. It is written for every armed buffer,
+     * zero included, so a trace known to be whole is distinguishable from one
+     * whose collector could not count. The stamp is the record clock: a live
+     * process appends to one shard, and the reader skips an earlier capture's
+     * counts by it. -1 says a shard write failed since the last count. */
+    rocprofiler_timestamp_t meta_ts = 0;
+    rocprofiler_get_timestamp(&meta_ts);
+    if (g_lost)
+        fprintf(g_fp, "{\"kind\":\"meta\",\"dropped_records\":-1,\"timestamp_ns\":%llu}\n",
+                (unsigned long long)meta_ts);
+    else
+        fprintf(g_fp, "{\"kind\":\"meta\",\"dropped_records\":%llu,\"timestamp_ns\":%llu}\n",
+                (unsigned long long)drop_count, (unsigned long long)meta_ts);
+    g_lost = 0;
 
     for (size_t i = 0; i < num_headers; i++) {
         rocprofiler_record_header_t *h = headers[i];
@@ -385,7 +398,10 @@ buffer_cb(rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer_id,
                     is_graph_launch_op(a->operation));
         }
     }
-    fflush(g_fp);
+    if (fflush(g_fp) != 0 || ferror(g_fp)) {
+        g_lost = 1;  /* the write did not land; say so once the stream works again */
+        clearerr(g_fp);
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -989,6 +1005,15 @@ static void tool_fini(void *tool_data) {
     emit_stamp_faults();
     pthread_mutex_lock(&g_lock);
     if (g_fp) {
+        /* An orderly exit: a shard from a dead process without this line was cut
+         * short. Not written when the last write failed, which is the same thing. */
+        if (!g_lost) {
+            rocprofiler_timestamp_t fini_ts = 0;
+            rocprofiler_get_timestamp(&fini_ts);
+            fprintf(g_fp, "{\"kind\":\"meta\",\"final\":true,\"timestamp_ns\":%llu}\n",
+                    (unsigned long long)fini_ts);
+        }
+        fflush(g_fp);
         fclose(g_fp);
         g_fp = NULL;
     }

@@ -20,7 +20,7 @@ additive.
 | `graphId`/`graphNodeId` on the kernel record | external-correlation **stamp** `(exec, ordinal)` from `hipGraphLaunch` callbacks | 7.2.3 has no graph id on a dispatch; built from the sdk's documented recipe. Validated per replay — see `docs/rocm_correlation.md`. |
 | capture-time node map (planned CUPTI NVTX/RESOURCE callbacks) | HIP-API callbacks during stream capture → `graph_node`, `EndCapture` + `Instantiate*` → `graph_exec` | Written unarmed (capture precedes any window). |
 | kernel → RUNTIME → range by host-time containment | kernel `range_id` **stamped at enqueue** with the innermost rocTX range on the launching thread | Exact join; containment kept as validator. |
-| dropped records: no signal | `drop_count` per buffer | The counter CUPTI never gave us. Emitted in-band as `{"kind":"meta","dropped_records":N}`; `read_shards` warns if non-zero, so a lossy AMD trace is *detectable* (the NVIDIA NVTX-lossiness question stays open). |
+| `cuptiActivityGetNumDroppedRecords` per buffer | `drop_count` per buffer | Both collectors write `{"kind":"meta","dropped_records":N}` for every armed buffer, zero included, stamped with the record clock. `read_shards_with_loss` adds them to the shard lines it could not read or decode and writes the total to the trace header's `dropped_records`, `null` when not known; it warns if non-zero. The CUPTI side is not yet run on hardware. |
 
 Semantics normalized in the tool so downstream sees one schema:
 
