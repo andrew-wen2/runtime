@@ -22,6 +22,16 @@ THRESHOLDS_VERSION = "2026-10-12.2"
 MIN_WINDOW_NS = 1_000_000_000
 #: Rows 10, 11, 22, 25 and G1 fire at this share of the window.
 FIRE_AT_WINDOW_SHARE = 0.01
+#: G4 lists a kernel name when it holds at least this share of a device's launches in
+#: one of capture and reference and is missing from the other, and fires on any name.
+#: The floor keeps rare, load-dependent kernels from firing it.
+G4_LAUNCH_SHARE_FLOOR = 0.005
+#: A name seen c times on one side and never on the other is listed only when that
+#: split is improbable for a kernel equally common on both whose launches fall
+#: independently: all c on one side has probability (n_a / (n_a + n_b)) ** c. It is
+#: listed when that is under this level divided by the number of names over the floor
+#: on either side. Per device; launches in a real server are not independent.
+G4_CHANCE_LEVEL = 0.01
 
 #: A priced row says where its time sat across slices of this length, a final partial
 #: slice left out. Past the maximum (about 28 h) no slices are built: no capture is
@@ -269,7 +279,7 @@ _ENTRIES: tuple[Primitive, ...] = (
 )
 
 #: Checks this build does not have. Their rows are ``cannot_tell``, ``not_built``.
-NOT_BUILT = ("G2", "G3", "G4")
+NOT_BUILT = ("G2", "G3")
 
 #: Ordered and read-only. Ids are strings: row numbers ``"1"``..``"25"`` and ``"G1"``..``"G4"``.
 REGISTRY: Mapping[str, Primitive] = MappingProxyType({p.id: p for p in _ENTRIES})

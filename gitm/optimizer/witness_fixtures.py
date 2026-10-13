@@ -122,7 +122,7 @@ def varying_batch(batch: int, seed: int = 0, *, window_s: float = 25.0) -> Fixtu
     Kernel time grows with the batch, a padding kernel appears only at some batches
     (well under 0.5% of launches), and one launch in a hundred follows its
     predecessor by 10 us. A change of load must not look like a cause: on this
-    capture no check may fire, at any batch.
+    capture no check may fire, at any batch, and two batches compared must not fire G4.
     """
     rng = random.Random(seed * 1000 + batch)
     events: list[TraceEvent] = []

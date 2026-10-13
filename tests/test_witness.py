@@ -27,6 +27,7 @@ REASONS = ("channel_missing", "invalid_capture", "undivided_group", "too_short",
            "no_passive_witness", "not_built")
 
 
+
 def K(start, end, name="gemm", *, dev=0, pid=None, stream=0):
     return KernelEvent(start_ns=start, end_ns=end, stream_id=stream, device_id=dev, name=name,
                        pid=pid)
@@ -175,7 +176,8 @@ def test_unusable_trace_gives_one_row_per_unit(events, header, needle):
         r = one(rep, row_id)
         assert (r["state"], r["reason"]) == ("cannot_tell", "invalid_capture")
         assert r["partition"]["all"] is True and needle in r["why"]
-    assert {one(rep, g)["reason"] for g in ("G2", "G3", "G4")} == {"not_built"}
+    assert one(rep, "G4")["reason"] == "invalid_capture"
+    assert one(rep, "G2")["reason"] == one(rep, "G3")["reason"] == "not_built"
     assert one(rep, "8")["reason"] == "undivided_group"
     assert rep.partitions == []
     # A row this build does not evaluate keeps its own reason on an unusable trace.
@@ -210,9 +212,11 @@ def test_every_id_appears_once_per_instance_of_its_scope():
 
 def test_unbuilt_groups_members_and_fixed_rows():
     rep = account(steady(1000), CUPTI)
-    for g in ("G2", "G3", "G4"):
+    for g in ("G2", "G3"):
         r = one(rep, g)
         assert (r["state"], r["reason"], r["seconds"]) == ("cannot_tell", "not_built", None)
+    assert (one(rep, "G4")["state"], one(rep, "G4")["reason"]) == ("cannot_tell",
+                                                                 "channel_missing")
     for m in ("6", "8", "9", "12", "13", "14", "15", "17", "23"):
         assert one(rep, m)["reason"] == "undivided_group"
     assert one(rep, "1")["reason"] == one(rep, "21")["reason"] == "no_passive_witness"
@@ -879,6 +883,19 @@ def test_sync_records_under_a_source_that_has_none_are_not_used(source):
                                          for i in range(999)], header)
     for row_id in ("G1", "remainder"):
         assert one(with_syncs, row_id)["seconds"] == one(plain, row_id)["seconds"]
+
+
+def test_manifest_read_failures_are_not_called_differences(tmp_path, capsys):
+    run_dir = write_run(tmp_path / "run", steady(1000))
+    ref_dir = tmp_path / "ref"
+    ref_dir.mkdir()
+    write_run(ref_dir, steady(1000))
+    (run_dir / "run_manifest.json").write_text("{}")
+    (ref_dir / "run_manifest.json").write_text("[1]")
+    assert witness.main([str(run_dir), "--reference", str(ref_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "note: reference manifest: run_manifest.json is not a JSON object" in out
+    assert "reference differs: run_manifest.json is not" not in out
 
 
 def test_a_pidless_record_outside_every_gap_changes_nothing_on_a_shared_device():

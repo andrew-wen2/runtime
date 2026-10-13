@@ -85,7 +85,8 @@ can be missing. All of these must hold:
   These rows call a kernel a collective by a substring of its name, and that classifier
   is unverified, so a priced row shows its time and is not `estimated` either.
 
-Row 24 is never `absent`: it does not check misroute. A count above zero makes every trace
+Row 24 and G4 are never `absent`: row 24 does not check misroute, and G4 rests on the
+caller's word that the reference is the same build. A count above zero makes every trace
 row not identifiable, priced or not, and so does a collector saying it lost records it
 could not count. `absent` describes this capture only. The count does not include records
 still in a collector's buffer when the capture closed.

@@ -6,7 +6,8 @@ with the cause. Per ``(pid, device)`` partition the account closes::
 
     busy + row 11 + row 10 + G1 + remainder = window     (window = the kernel span)
 
-Rows 22 and 25 sit inside busy and are not in that sum. Everything here is read from the trace: the server's
+Rows 22 and 25 sit inside busy, and G4 compares kernel names against a reference
+capture; neither is in that sum. Everything here is read from the trace: the server's
 ``/metrics`` counters (rows 2 to 5) are not read by this build. A time here is
 *associated* with a cause. It is not the time removing the cause would recover.
 
@@ -23,7 +24,7 @@ leaves such a row not identifiable.
 The capture must come from a server started under gitm's injection library; nothing
 here diagnoses an unmodified running server. Validated on synthetic data only.
 
-    python -m gitm.optimizer.witness RUN_DIR [--all] [--json]
+    python -m gitm.optimizer.witness RUN_DIR [--reference REF_DIR] [--all] [--json]
 """
 
 from __future__ import annotations
@@ -107,6 +108,7 @@ class Report:
     baselines: list[dict[str, Any]]
     run_presence: dict[str, str]
     records_unplaced: int = 0
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return _strict_json(asdict(self))
@@ -117,9 +119,10 @@ class Report:
 _MALFORMED = (ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError)
 #: Timestamps past this cannot be nanoseconds, and would overflow the float seconds.
 _MAX_NS = 2**62
-#: A header line, a printed name: bounded so a hostile file cannot cost memory.
+#: A header line, a manifest, a printed name: bounded so a hostile file cannot cost memory.
 _MAX_HEADER_BYTES = 1_000_000
 _MAX_EVENT_BYTES = 1_000_000
+_MAX_MANIFEST_BYTES = 1_000_000
 #: More (pid, device) partitions than any capture has: each one costs a full set of rows.
 _MAX_PARTITIONS = 1024
 #: Distinct sync or memcpy labels a row splits its time by; the rest are folded together.
@@ -377,6 +380,8 @@ _ASSUMPTION_NEXT = {
     "other_pid_active_on_device": "trace one process per device",
     "no_sync_records_in_source": _NO_SYNC_NEXT,
     "no_memcpy_records_in_source": _NO_COPY_NEXT,
+    "reference_asserted_by_caller": "NVTX op identity, which shows a changed kernel without "
+                                    "relying on the reference",
     "collective_classified_by_name_only": "NVTX op identity, or the op classifier checked "
                                           "against a real multi-device capture",
     "misrouted_kernel_not_checked": "NVTX op identity, to check for misrouted kernels",
@@ -771,6 +776,141 @@ def _device_rows(device_id: int, parts: list[_Partition],
     return rows
 
 
+def _launch_counts(parts: list[_Partition], names: list[str]
+                   ) -> dict[int, dict[str, Any]]:
+    """Per device, pids pooled: launches per kernel name, the kernel span, any fault."""
+    out: dict[int, dict[str, Any]] = {}
+    for part in parts:
+        d = out.setdefault(part.device_id, {"counts": Counter(), "w0": None, "w1": None,
+                                            "invalid": None})
+        d["invalid"] = d["invalid"] or part.invalid
+        for start, end, _, name_id in part.kernels:
+            d["counts"][names[name_id]] += 1
+            if end > start:  # a zero-length kernel is a launch and no part of the window
+                d["w0"] = start if d["w0"] is None else min(d["w0"], start)
+                d["w1"] = end if d["w1"] is None else max(d["w1"], end)
+    return out
+
+
+def _load_reference(header: Any, events: Iterable[Any]) -> dict[str, Any]:
+    """What G4 needs from a reference capture; its events are not kept."""
+    if not isinstance(header, Header) or not _is_id(header.device_count):
+        return {"problem": "the reference has no usable header"}
+    try:
+        fault, parts, names, _, _ = _place(_normalize(events), header)
+    except WitnessInputError as exc:  # a reference file is read lazily
+        return {"problem": str(exc)}
+    return {"header": header, "fault": fault, "devices": _launch_counts(parts, names)}
+
+
+_G4_NEXT = ("pass --reference REF_DIR, an earlier capture the caller states is the same model, "
+            "engine version and SKU")
+_G4_UNPRICED = "unpriced: needs a calibration capture to say what the changed kernels cost"
+
+
+def _g4_row(device_id: int, mine: dict[str, Any] | None, header: Header,
+            reference: dict[str, Any] | None) -> dict[str, Any]:
+    """Kernel names in one of capture and reference and missing from the other.
+
+    A fusion, precision or algorithm fallback changes which kernels run, and so does
+    an incidental rename: a hash, a template argument, an address or a mangled
+    spelling in the name, a kernel that only runs in some phases, another process on
+    the device. The row says the names differ and never why. A name is listed only
+    when the other side is large enough that its absence is unlikely to be chance.
+    """
+    g4 = prim.get("G4")
+    key = {"pid": None, "device_id": device_id}
+    if mine is not None and mine["invalid"]:
+        return _cannot(g4, key, "invalid_capture", "the device's events are inconsistent",
+                       mine["invalid"], "re-capture; the trace is not usable as written")
+    if reference is None:
+        return _cannot(g4, key, "channel_missing", "no reference capture given",
+                       "a kernel-name change is only visible against another capture", _G4_NEXT)
+    extra = {"assumptions": ["reference_asserted_by_caller"],
+             "reference_warnings": reference.get("warnings", [])}
+    if reference.get("problem"):
+        return _cannot(g4, key, "channel_missing", "no usable reference capture",
+                       reference["problem"], _G4_NEXT, **extra)
+    if reference.get("fault"):
+        return _cannot(g4, key, "invalid_capture", "the reference capture is not usable",
+                       reference["fault"], _G4_NEXT, **extra)
+    if reference.get("identity_mismatch"):
+        # The row's premise is the same model; a manifest that says otherwise outranks it.
+        return _cannot(g4, key, "invalid_capture",
+                       f"capture and reference differ in {', '.join(reference['identity_mismatch'])}",
+                       "run_manifest.json states a different one for each", _G4_NEXT, **extra)
+    ref_header: Header = reference["header"]
+    unstated = sorted(set(header.missing) | set(ref_header.missing))
+    if unstated:
+        return _cannot(g4, key, "invalid_capture",
+                       f"a trace header does not state {', '.join(unstated)}",
+                       "capture and reference can only be compared on fields both state",
+                       _G4_NEXT, **extra)
+    for name in ("vendor", "device_count", "source"):
+        if getattr(header, name) != getattr(ref_header, name):
+            return _cannot(g4, key, "invalid_capture", f"capture and reference differ in {name}",
+                           f"{str(getattr(header, name))[:40]} against "
+                           f"{str(getattr(ref_header, name))[:40]}", _G4_NEXT, **extra)
+    theirs = reference["devices"].get(device_id)
+    if mine is None:
+        return _cannot(g4, key, "channel_missing", "the capture has no kernels on this device",
+                       "the reference does; names are compared per device, by device id",
+                       "check that both captures cover the same devices in the same order",
+                       **extra)
+    if theirs is None:
+        return _cannot(g4, key, "channel_missing", "the reference has no kernels on this device",
+                       "names are compared per device, by device id",
+                       "check that both captures cover the same devices in the same order",
+                       **extra)
+    if theirs["invalid"]:
+        return _cannot(g4, key, "invalid_capture", "the reference capture is not usable",
+                       theirs["invalid"], _G4_NEXT, **extra)
+    for label, d in (("capture", mine), ("reference", theirs)):
+        if d["w1"] - d["w0"] < prim.MIN_WINDOW_NS:
+            return _cannot(g4, key, "too_short",
+                           f"the {label}'s device window is {(d['w1'] - d['w0']) / 1e9:.3f} s",
+                           f"a window under {prim.MIN_WINDOW_NS / 1e9:.0f} s is not evaluated",
+                           "capture a longer window", **extra)
+
+    def over_floor(c: Counter) -> int:
+        total = sum(c.values())
+        return sum(1 for n in c.values() if n >= prim.G4_LAUNCH_SHARE_FLOOR * total)
+
+    # Every name over the floor on either side is a name that was examined.
+    examined = max(1, over_floor(mine["counts"]) + over_floor(theirs["counts"]))
+
+    def missing_from(a: Counter, b: Counter) -> tuple[list[str], list[str]]:
+        """Names over the floor in ``a`` and absent from ``b``: judged, and too rare to judge."""
+        total, other = sum(a.values()), sum(b.values())
+        judged, rare = [], []
+        for name, count in a.items():
+            if count < prim.G4_LAUNCH_SHARE_FLOOR * total or name in b:
+                continue
+            # If the kernel were equally common on both sides and its launches fell
+            # independently, each would land on this side with probability
+            # total / (total + other).
+            chance = (total / (total + other)) ** count
+            (judged if chance < prim.G4_CHANCE_LEVEL / examined else rare).append(name)
+        return sorted(judged), sorted(rare)
+
+    only_capture, rare_capture = missing_from(mine["counts"], theirs["counts"])
+    only_reference, rare_reference = missing_from(theirs["counts"], mine["counts"])
+    changed = only_capture + only_reference
+    too_rare = rare_capture + rare_reference
+    return _row(
+        g4, key, "fired" if changed else "not_fired",
+        observation={"kind": "names", "value": len(changed), "unit": "kernel names",
+                     "names": changed[:50]},
+        price_reason=_G4_UNPRICED, completeness=_completeness(header)[0],
+        completeness_note=_completeness(header)[1],
+        only_in_capture=only_capture[:50], only_in_reference=only_reference[:50],
+        names_too_rare_to_judge=len(too_rare), too_rare_examples=too_rare[:10],
+        names_examined=examined,
+        launches={"capture": sum(mine["counts"].values()),
+                  "reference": sum(theirs["counts"].values())}, **extra,
+    )
+
+
 def _safe(value: Any, limit: int = 80) -> str:
     """Text from a file made safe to print: no control or non-ASCII characters, bounded."""
     raw = str(value)
@@ -1013,13 +1153,30 @@ def _group_rows(scope: str, key: dict[str, Any]) -> list[dict[str, Any]]:
 def account(
     events: Iterable[Any],
     header: Header,
+    *,
+    reference: tuple[Header, Iterable[Any]] | None = None,
+    reference_warnings: Iterable[str] = (),
+    _reference: dict[str, Any] | None = None,
 ) -> Report:
     """Run every built check on events in memory.
 
     ``events`` are trace events (pydantic, the importers' slotted classes, or the
-    tuples the file reader yields) in any order.
+    tuples the file reader yields) in any order. ``reference`` is the header and
+    events of an earlier capture the caller states is the same model, engine version
+    and SKU, for the kernel-identity check.
     """
     fault, parts, names, unplaced, n_records = _place(_normalize(events), header)
+    ref: dict[str, Any] | None = None
+    if _reference is not None:  # already reduced by run()
+        ref = _reference
+    elif reference is not None:
+        try:
+            ref_header, ref_events = reference
+            ref = _load_reference(ref_header, iter(ref_events))
+        except (TypeError, ValueError):
+            ref = {"problem": "the reference is not a (header, events) pair"}
+    if ref is not None:
+        ref["warnings"] = [str(w) for w in reference_warnings]
 
     results: list[dict[str, Any]] = []
     infos: list[dict[str, Any]] = []
@@ -1030,6 +1187,11 @@ def account(
             if p.id in prim.NOT_BUILT or p.group:
                 # These keep their own reason: the trace would not have settled them.
                 results.extend(r for r in _group_rows(p.scope, _ALL) if r["id"] == p.id)
+            elif p.id == "G4" and ref is not None:
+                results.append(_cannot(
+                    p, _ALL, "invalid_capture", "the trace is not usable", fault,
+                    "re-capture; see the reason", assumptions=["reference_asserted_by_caller"],
+                    reference_warnings=ref["warnings"]))
             else:
                 results.append(_cannot(p, _ALL, "invalid_capture", "the trace is not usable",
                                        fault, "re-capture; see the reason"))
@@ -1040,6 +1202,7 @@ def account(
         for part in parts:
             by_device[part.device_id].append(part)
         n_devices = max(header.device_count, len(by_device))
+        launches = _launch_counts(parts, names)
         no_sync = None
         if header.source in _NO_SYNC_SOURCES:
             no_sync = f"{header.source} traces carry no synchronization records"
@@ -1060,7 +1223,12 @@ def account(
                 results.extend(rows)
                 results.extend(_group_rows("partition", part.key))
             results.extend(_device_rows(device_id, group, names, header, n_devices))
+            results.append(_g4_row(device_id, launches[device_id], header, ref))
             results.extend(_group_rows("device", {"pid": None, "device_id": device_id}))
+        # A device only the reference has is said, not dropped.
+        for device_id in sorted(set((ref or {}).get("devices", {})) - set(by_device)):
+            if not (ref.get("problem") or ref.get("fault")):
+                results.append(_g4_row(device_id, None, header, ref))
 
     results.append(_drop_row(header))
     results.extend(_fixed_rows())
@@ -1108,12 +1276,109 @@ def account(
     )
 
 
-def run(run_dir: str | Path) -> Report:
-    """Run the checks on a capture directory. Raises only :class:`WitnessInputError`."""
+#: Manifest blocks that describe the run itself and so always differ between two captures.
+_MANIFEST_PER_RUN = ("trace", "preflight", "target")
+
+
+#: Manifest values safe to print. Everything else is named, never quoted: a command
+#: line or a target can hold an API key.
+_MANIFEST_PRINTABLE = ("served_model", "capture_mode", "workload_id", "window", "duration_s")
+#: Keys that say what was captured: G4 does not compare two captures that differ in one.
+_MANIFEST_IDENTITY = ("served_model",)
+
+
+def _read_manifest(path: Path) -> tuple[bool, Any, str | None]:
+    """A ``run_manifest.json``: whether it is there, its JSON, and why it could not be read."""
+    try:
+        if not path.is_file():
+            return False, None, None
+        if path.stat().st_size > _MAX_MANIFEST_BYTES:
+            return True, None, "is too large to read"
+        return True, json.loads(path.read_text(encoding="utf-8", errors="replace")), None
+    except (OSError, ValueError, TypeError, RecursionError):
+        return True, None, "could not be read"
+
+
+def _manifest_differences(run_dir: Path, ref_dir: Path) -> tuple[list[str], list[str]]:
+    """Keys both run manifests carry with different values, and which of them are identity keys.
+
+    The first list is warnings only. A few known keys are quoted, and only when both
+    values are scalars; anything else is named and its value is never printed.
+    """
+    try:
+        loaded = []
+        for path in (run_dir / "run_manifest.json", ref_dir / "run_manifest.json"):
+            there, manifest, problem = _read_manifest(path)
+            if not there:
+                return [], []
+            if problem == "is too large to read":
+                return [f"{path.name} is too large to compare"], []
+            if problem:
+                return ["run_manifest.json could not be read and was not compared"], []
+            loaded.append(manifest)
+        mine, theirs = loaded
+        if not isinstance(mine, dict) or not isinstance(theirs, dict):
+            return ["run_manifest.json is not a JSON object and was not compared"], []
+
+        def text(v: Any) -> str:  # compared as text, so NaN equals NaN
+            return json.dumps(v, sort_keys=True, default=str)
+
+        def scalar(v: Any) -> bool:
+            return v is None or isinstance(v, (str, int, float, bool))
+
+        out, identity = [], []
+        for k in sorted(mine.keys() & theirs.keys()):
+            if k in _MANIFEST_PER_RUN or text(mine[k]) == text(theirs[k]):
+                continue
+            if k in _MANIFEST_IDENTITY:
+                identity.append(k)
+            if k in _MANIFEST_PRINTABLE and scalar(mine[k]) and scalar(theirs[k]):
+                out.append(f"run_manifest.json {k}: {text(mine[k])[:60]} against "
+                           f"{text(theirs[k])[:60]}")
+            else:
+                out.append(f"run_manifest.json {str(k)[:60]} differs")
+        if len(out) > 20:
+            out = out[:20] + [f"run_manifest.json has {len(out) - 20} more differing keys"]
+        return out, identity
+    except (OSError, ValueError, TypeError, RecursionError):
+        return ["run_manifest.json could not be read and was not compared"], []
+
+
+def run(run_dir: str | Path, reference: str | Path | None = None) -> Report:
+    """Run the checks on a capture directory. Raises only :class:`WitnessInputError`.
+
+    ``reference`` is the directory of an earlier capture the caller states is the same
+    model, engine version and SKU; the kernel-name check (G4) compares against it.
+    A reference that cannot be read is a state on that row, never an exception.
+    """
     run_dir = Path(run_dir)
     header, events = _read_trace(run_dir / "trace.jsonl")
-    report = account(events, header)
-    report.inputs = {"found": ["trace.jsonl"], "missing": []}
+    found, missing = ["trace.jsonl"], []
+    ref: dict[str, Any] | None = None
+    warnings: list[str] = []
+    if reference is not None:
+        ref_dir = Path(reference)
+        label = f"reference {ref_dir / 'trace.jsonl'}"
+        try:
+            same = ref_dir.resolve() == run_dir.resolve()
+        except OSError:
+            same = False
+        if same:
+            ref = {"problem": "the reference directory is the capture directory itself"}
+        else:
+            try:
+                ref = _load_reference(*_read_trace(ref_dir / "trace.jsonl"))
+            except WitnessInputError as exc:
+                ref = {"problem": str(exc)}
+        (missing if ref.get("problem") else found).append(label)
+        if not ref.get("problem"):
+            warnings, ref["identity_mismatch"] = _manifest_differences(run_dir, ref_dir)
+    report = account(events, header, _reference=ref, reference_warnings=warnings)
+    report.inputs = {"found": found, "missing": missing}
+    # Only a per-key entry is a difference; "could not be read" is not.
+    report.notes.extend(
+        ("reference differs: " if w.endswith(" differs") or " against " in w
+         else "reference manifest: ") + w for w in warnings)
     return report
 
 
@@ -1153,6 +1418,7 @@ def _render(report: Report, show_all: bool = False) -> str:
         "inputs found: " + ", ".join(report.inputs["found"] or ["none"])
         + "; missing: " + ", ".join(report.inputs["missing"] or ["none"]),
     ]
+    lines += [f"note: {_safe(n, 300)}" for n in report.notes]
     for info in report.partitions:
         lines.append(
             f"{_where(info)}: window {info['window_s']:.3f} s, busy {info['busy_s']:.3f} s"
@@ -1169,6 +1435,8 @@ def _render(report: Report, show_all: bool = False) -> str:
                 head += ", associated)" if r.get("price_kind") else ")"
         elif r.get("observation"):
             head += f": {r['observation']['value']:.4g} {r['observation']['unit']}"
+            if r["observation"].get("names"):
+                head += " (" + ", ".join(_safe(n) for n in r["observation"]["names"][:5]) + ")"
         lines.append(head)
         if r.get("status"):
             reason, detail = r["status_reason"], r["status_detail"]
@@ -1238,10 +1506,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--all", action="store_true", dest="show_all",
                     help="also print group members, rows not evaluated in this build, and "
                          "baselines (witness.json always holds every row)")
+    ap.add_argument("--reference", type=Path, metavar="REF_DIR",
+                    help="an earlier capture of the same model, engine version and SKU, for the "
+                         "kernel-identity check (G4)")
     args = ap.parse_args(argv)
     out = args.run_dir / "witness.json"
     try:
-        report = run(args.run_dir)
+        report = run(args.run_dir, args.reference)
     except WitnessInputError as exc:
         stale = f"; the existing {out} is stale and was left untouched" if out.exists() else ""
         print(f"witness checks did not run: {exc}. Point RUN_DIR at a capture directory "

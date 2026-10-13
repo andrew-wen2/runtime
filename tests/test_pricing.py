@@ -209,10 +209,11 @@ def test_a_blocker_other_than_drops_keeps_a_row_from_absent():
     two = account(generate(0).events + generate(1, device_id=1).events,
                   Header(source="cupti", device_count=2, dropped_records=0))
     assert {r["status"] for r in two.results if r["id"] in ("22", "25")} == {NOT_ID}
-    # Row 24 does not check misroute.
-    quiet = account(generate(0).events, whole)
-    assert (one(quiet, "24")["state"], one(quiet, "24")["status"]) == ("not_fired", NOT_ID)
-    assert "misrouted" in one(quiet, "24")["status_detail"]
+    # G4 rests on the caller's word about the reference, row 24 does not check misroute.
+    ref = account(generate(0).events, whole, reference=(whole, generate(2).events))
+    assert (one(ref, "G4")["state"], one(ref, "G4")["status"]) == ("not_fired", NOT_ID)
+    assert (one(ref, "24")["state"], one(ref, "24")["status"]) == ("not_fired", NOT_ID)
+    assert "misrouted" in one(ref, "24")["status_detail"]
 
 
 @pytest.mark.parametrize("device_count, missing", [(0, ()), (-3, ()), (1, ("device_count",))])
@@ -277,6 +278,11 @@ def test_next_on_fired_rows_with_no_price():
     ev = generate(0, window_s=2.0).events
     r = one(account(ev, Header(dropped_records=5)), "24")
     assert r["next"] == witness._LOSSY_NEXT and "not known" in r["price_reason"]
+    whole = Header(source="cupti", dropped_records=0)
+    ref = [e.model_copy(update={"name": "gemm_v2"}) if isinstance(e, KernelEvent) else e
+           for e in ev]
+    g4 = one(account(ev, whole, reference=(whole, ref)), "G4")
+    assert g4["state"] == "fired" and g4["next"] == prim.get("G4").remedy
 
 
 def test_row_24_reads_the_drop_count():
@@ -465,11 +471,19 @@ def test_no_check_fires_on_a_clean_capture_at_any_batch(batch):
     for row_id in ("10", "11", "G1", "22", "25"):
         assert one(rep, row_id)["state"] == "not_fired", row_id
     assert one(rep, "G1")["share"] <= 0.005  # short gaps are there, under half a percent
-    assert (one(rep, "G2")["reason"], one(rep, "G4")["reason"]) == ("not_built", "not_built")
+    assert (one(rep, "G2")["reason"], one(rep, "G4")["reason"]) == ("not_built", "channel_missing")
     for row_id in ("2", "3", "4", "5"):
         assert one(rep, row_id)["reason"] == "not_built"
     assert not [r["id"] for r in rep.results if r.get("status") in ("estimated", "absent")]
     assert one(rep, "G3")["reason"] == "not_built"
+
+
+@pytest.mark.parametrize("batch, other", [(1, 8), (8, 32), (32, 1)])
+def test_two_batches_of_the_same_build_do_not_fire_g4(batch, other):
+    reference = (CUPTI, witness_fixtures.varying_batch(other, seed=1).events)
+    r = one(account(witness_fixtures.varying_batch(batch).events, CUPTI, reference=reference),
+            "G4")
+    assert r["state"] == "not_fired" and r["observation"]["value"] == 0
 
 
 def test_an_estimated_row_carries_only_the_one_stated_assumption():

@@ -44,9 +44,10 @@ no record that would have raised it can be missing. That needs all of:
 * a source that counts: ``cupti`` or ``rocprof``. An imported trace cannot count,
   whatever its header says;
 * no assumption on the row: another traced pid on the device, or a kind the source
-  drops, leaves the split of the gap time unverified; rows 22 and 25 rest on a
-  kernel name classifier never checked against a real capture, unless the header
-  states exactly one device and no name matched; row 24 does not check misroute.
+  drops, leaves the split of the gap time unverified; G4 rests on the caller's word
+  that the reference is the same build; rows 22 and 25 rest on a kernel name
+  classifier never checked against a real capture, unless the header states exactly
+  one device and no name matched; row 24 does not check misroute.
 
 The same assumptions keep a fired row from ``estimated``, so rows 22 and 25 show
 their time and are not identifiable until the classifier is checked.

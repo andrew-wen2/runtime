@@ -30,7 +30,8 @@ def test_registry_is_read_only_and_get_takes_row_numbers():
 def test_constants_read_back():
     # Registered values. A change here is a re-registration: bump THRESHOLDS_VERSION.
     assert prim.THRESHOLDS_VERSION == "2026-10-12.2"
-    assert prim.NOT_BUILT == ("G2", "G3", "G4")
+    assert (prim.G4_LAUNCH_SHARE_FLOOR, prim.G4_CHANCE_LEVEL) == (0.005, 0.01)
+    assert prim.NOT_BUILT == ("G2", "G3")
     assert (prim.SLICE_NS, prim.MAX_SLICES) == (1_000_000_000, 100_000)
     assert prim.STATUSES == ("estimated", "not_identifiable_from_this_data", "absent")
     assert prim.MIN_WINDOW_NS == 1_000_000_000
