@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
+from pathlib import Path
 
 import pytest
 
@@ -597,3 +599,39 @@ def test_main_called_from_another_entry_point_does_not_choose_spawn(monkeypatch)
 def test_gitm_run_leaves_the_start_method_alone_on_nvidia(monkeypatch):
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
     assert _cli_run_env(monkeypatch, "nvidia") is None
+
+
+@pytest.mark.parametrize("src", ["_cupti/cupti_inject.c"])
+def test_the_c_collectors_meta_lines_are_the_ones_the_reader_counts(run_env, monkeypatch, src):
+    """The C cannot be built here; this at least ties its printed lines to the reader's keys."""
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: False)
+    text = (Path(injection.__file__).parent / src).read_text()
+    fmts = [m.encode().decode("unicode_escape") for m in
+            re.findall(r'fprintf\(g_fp, "(\{\\"kind\\":\\"meta\\".*?)\\n"', text)]
+    count = [f for f in fmts if "dropped_records" in f]
+    final = [f for f in fmts if "final" in f]
+    assert count and len(final) == 1, fmts
+
+    def fill(fmt, n):
+        """The line the C would print: the count, then the stamp."""
+        if "%lld" in fmt:  # CUPTI prints a signed count
+            return fmt.replace("%lld", str(n)).replace("%llu", "150")
+        if fmt.count("%llu") == 2:  # ROCm prints an unsigned one
+            return fmt.replace("%llu", str(n), 1).replace("%llu", "150")
+        return fmt.replace("%llu", "150")  # the count is written in the format itself
+
+    shard = run_env.with_name(run_env.name + ".111")
+    k = _kernel("k", 160, 170) + "\n"
+    done = fill(final[0], 0) + "\n"
+    for f in count:
+        lost = '"dropped_records":-1' in f
+        shard.write_text(fill(f, 0) + "\n" + k + done)
+        assert injection.read_shards_with_loss(100, 300)[1] == (-1 if lost else 0), f
+        shard.write_text(fill(f, 0) + "\n" + k)  # died without its final line
+        assert injection.read_shards_with_loss(100, 300)[1] == -1
+    # Each collector has a way to say "lost, not counted".
+    assert any('"dropped_records":-1' in f or "%lld" in f for f in count)
+    signed = [f for f in count if "%lld" in f]
+    if signed:
+        shard.write_text(fill(signed[0], -1) + "\n" + k + done)
+        assert injection.read_shards_with_loss(100, 300)[1] == -1

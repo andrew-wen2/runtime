@@ -122,11 +122,22 @@ typedef void (*gitm_sink_fn)(const gitm_record *rec, void *user);
 /* Called once at the top of each completed CUPTI buffer, under the core's lock,
  * before any records from that buffer are sunk. The injection sink uses this to
  * refresh its armed/disarmed state with one stat() per buffer instead of one per
- * kernel. */
-typedef void (*gitm_buffer_fn)(void *user);
+ * kernel.
+ *
+ * `dropped` is cuptiActivityGetNumDroppedRecords for the buffer's queue: records
+ * CUPTI could not store since the previous buffer on that queue (the call resets
+ * the count). Negative when CUPTI would not say, which is not zero. `now_ns` is
+ * the CUPTI clock, 0 if it could not be read. Both are read before the core takes
+ * its lock, so no CUPTI call but the record walk runs under it. */
+typedef void (*gitm_buffer_fn)(int64_t dropped, uint64_t now_ns, void *user);
+
+/* Called once after the last record of the buffer has been sunk, under the lock.
+ * `failed` is non-zero when the record walk stopped on an error, which loses the
+ * rest of the buffer. */
+typedef void (*gitm_buffer_done_fn)(int failed, void *user);
 
 void gitm_set_sink(gitm_sink_fn sink, void *user);
-void gitm_set_buffer_hook(gitm_buffer_fn hook, void *user);
+void gitm_set_buffer_hook(gitm_buffer_fn hook, gitm_buffer_done_fn done, void *user);
 
 /* Register callbacks and enable the activity kinds GITM models. Idempotent. */
 CUptiResult gitm_cupti_start(void);

@@ -35,13 +35,30 @@
 static gitm_record *g_records = NULL;
 static size_t g_count = 0;
 static size_t g_cap = 0;
+/* Records lost since the last dropped() call: CUPTI's own count plus the ones
+ * dropped below. Negative once CUPTI declined to report a count, until read. */
+static long long g_dropped = 0;
+
+static void count_dropped(int64_t dropped, uint64_t now_ns, void *user) {
+    (void)now_ns; (void)user;
+    if (dropped < 0 || g_dropped < 0) g_dropped = -1;
+    else g_dropped += dropped;
+}
+
+static void buffer_failed(int failed, void *user) {
+    (void)user;
+    if (failed) g_dropped = -1;  /* the rest of that buffer is gone, uncounted */
+}
 
 static void store_sink(const gitm_record *rec, void *user) {
     (void)user;
     if (g_count == g_cap) {
         size_t ncap = g_cap ? g_cap * 2 : 4096;
         gitm_record *n = (gitm_record *)realloc(g_records, ncap * sizeof(gitm_record));
-        if (!n) return;  /* drop the record rather than abort the workload */
+        if (!n) {  /* drop the record rather than abort the workload */
+            if (g_dropped >= 0) g_dropped++;
+            return;
+        }
         g_records = n;
         g_cap = ncap;
     }
@@ -57,6 +74,7 @@ static PyObject *py_start(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     g_count = 0;  /* fresh trace */
     gitm_set_sink(store_sink, NULL);
+    gitm_set_buffer_hook(count_dropped, buffer_failed, NULL);
     CUptiResult st = gitm_cupti_start();
     if (st != CUPTI_SUCCESS) return set_cupti_error(st, "start");
     Py_RETURN_NONE;
@@ -142,6 +160,17 @@ static PyObject *py_stop(PyObject *self, PyObject *args) {
     return list;
 }
 
+/* Records lost since the last call; negative when CUPTI did not report a count.
+ * Call it once after stop(): stop's flush has delivered the last buffers and no
+ * callback is running, so the read needs no lock. Reading resets the count, and
+ * start() does not, so a second start() cannot zero a live capture's losses. */
+static PyObject *py_dropped(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+    long long n = g_dropped;
+    g_dropped = 0;
+    return PyLong_FromLongLong(n);
+}
+
 static PyObject *py_device_count(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     return PyLong_FromLong(gitm_cuda_device_count());
@@ -160,6 +189,7 @@ static PyObject *py_timestamp(PyObject *self, PyObject *args) {
 static PyMethodDef methods[] = {
     {"start", py_start, METH_NOARGS, "Enable CUPTI activity collection."},
     {"stop", py_stop, METH_NOARGS, "Flush and return the record dicts."},
+    {"dropped", py_dropped, METH_NOARGS, "Records lost since the last call (resets); negative if unknown."},
     {"device_count", py_device_count, METH_NOARGS, "Number of CUPTI devices."},
     {"timestamp", py_timestamp, METH_NOARGS, "CUPTI clock now (activity time base)."},
     {NULL, NULL, 0, NULL},

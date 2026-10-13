@@ -54,6 +54,10 @@
 static FILE *g_fp = NULL;
 static char  g_arm_path[PATH_MAX];
 static int   g_armed = 0;
+/* Set when records were lost in a way CUPTI's count does not cover (a failed
+ * record walk or shard write). The next count line then says "unknown". */
+static int   g_lost = 0;
+static uint64_t g_buffer_ns = 0;  /* CUPTI clock at the top of the current buffer */
 
 /* JSON-escape a kernel name. Mangled C++ template names routinely carry quotes,
  * backslashes and control bytes; an unescaped one would corrupt the shard and take
@@ -75,11 +79,38 @@ static void write_json_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
+/* A dropped-record count line: not an event, read by read_shards_with_loss. The
+ * timestamp lets a later capture skip the lines of an earlier one, since a live
+ * process appends to one shard. */
+static void write_count(int64_t dropped) {
+    fprintf(g_fp, "{\"kind\":\"meta\",\"dropped_records\":%lld,\"timestamp_ns\":%llu}\n",
+            (long long)dropped, (unsigned long long)g_buffer_ns);
+}
+
 /* One stat() per completed buffer, refreshing the armed flag for the records that
- * buffer is about to yield. */
-static void refresh_armed(void *user) {
+ * buffer is about to yield. Every armed buffer also writes its count, zero
+ * included: a shard with no such line came from a library that cannot count, and
+ * the reader must not take that as "nothing dropped". */
+static void refresh_armed(int64_t dropped, uint64_t now_ns, void *user) {
     (void)user;
     g_armed = (access(g_arm_path, F_OK) == 0);
+    g_buffer_ns = now_ns;
+    if (g_fp && g_armed) {
+        write_count(g_lost ? -1 : dropped);
+        g_lost = 0;
+    }
+}
+
+/* After the buffer's last record: put the buffer on disk. The reader merges a
+ * live process's shard, so what is still in stdio does not exist for it. */
+static void buffer_done(int failed, void *user) {
+    (void)user;
+    if (!g_fp || !g_armed) return;
+    if (failed) write_count(-1);
+    if (fflush(g_fp) != 0 || ferror(g_fp)) {
+        g_lost = 1;  /* the write did not land; say so once the stream works again */
+        clearerr(g_fp);
+    }
 }
 
 static void file_sink(const gitm_record *r, void *user) {
@@ -156,7 +187,19 @@ static void file_sink(const gitm_record *r, void *user) {
 
 static void finish(void) {
     if (!g_fp) return;
-    gitm_cupti_stop();   /* disable + force flush; the sink drains into g_fp */
+    /* disable + force flush; the sink drains into g_fp */
+    CUptiResult stopped = gitm_cupti_stop();
+    /* Detach under the core's lock, so no callback is still writing to g_fp. Hooks
+     * first: a buffer that still arrives must not write a count for records the
+     * detached sink would discard. */
+    gitm_set_buffer_hook(NULL, NULL, NULL);
+    gitm_set_sink(NULL, NULL);
+    /* An orderly exit: a shard from a dead process without this line was cut short.
+     * Not written when the last flush or write failed, which is the same thing. */
+    if (stopped == CUPTI_SUCCESS && !g_lost) {
+        fprintf(g_fp, "{\"kind\":\"meta\",\"final\":true,\"timestamp_ns\":%llu}\n",
+                (unsigned long long)gitm_cupti_timestamp());
+    }
     fflush(g_fp);
     fclose(g_fp);
     g_fp = NULL;
@@ -187,7 +230,7 @@ int InitializeInjection(void) {
     setvbuf(g_fp, NULL, _IOFBF, 1 << 20);
 
     gitm_set_sink(file_sink, NULL);
-    gitm_set_buffer_hook(refresh_armed, NULL);
+    gitm_set_buffer_hook(refresh_armed, buffer_done, NULL);
 
     if (gitm_cupti_start() != CUPTI_SUCCESS) {
         fclose(g_fp);

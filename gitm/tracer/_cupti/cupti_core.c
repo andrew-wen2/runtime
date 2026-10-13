@@ -33,6 +33,7 @@
 static gitm_sink_fn   g_sink = NULL;
 static void          *g_sink_user = NULL;
 static gitm_buffer_fn g_buffer_hook = NULL;
+static gitm_buffer_done_fn g_buffer_done = NULL;
 static void          *g_buffer_user = NULL;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_enabled = 0;
@@ -87,9 +88,10 @@ void gitm_set_sink(gitm_sink_fn sink, void *user) {
     pthread_mutex_unlock(&g_lock);
 }
 
-void gitm_set_buffer_hook(gitm_buffer_fn hook, void *user) {
+void gitm_set_buffer_hook(gitm_buffer_fn hook, gitm_buffer_done_fn done, void *user) {
     pthread_mutex_lock(&g_lock);
     g_buffer_hook = hook;
+    g_buffer_done = done;
     g_buffer_user = user;
     pthread_mutex_unlock(&g_lock);
 }
@@ -524,21 +526,35 @@ static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size,
 
 static void CUPTIAPI buffer_completed(CUcontext ctx, uint32_t streamId,
                                       uint8_t *buffer, size_t size, size_t validSize) {
-    (void)ctx; (void)streamId; (void)size;
+    (void)size;
     CUpti_Activity *record = NULL;
+    size_t dropped = 0;
+    int64_t n_dropped = -1;  /* unknown unless CUPTI answers */
+    int failed = 0;
+
+    /* Before the lock: CUPTI may take its own, and a flush on another thread can
+     * be inside CUPTI waiting for ours. */
+    if (cuptiActivityGetNumDroppedRecords(ctx, streamId, &dropped) == CUPTI_SUCCESS) {
+        n_dropped = (int64_t)dropped;
+    }
+    uint64_t now_ns = gitm_cupti_timestamp();
 
     pthread_mutex_lock(&g_lock);
-    if (g_buffer_hook) g_buffer_hook(g_buffer_user);
+    if (g_buffer_hook) g_buffer_hook(n_dropped, now_ns, g_buffer_user);
     if (validSize > 0) {
         for (;;) {
             CUptiResult st = cuptiActivityGetNextRecord(buffer, validSize, &record);
             if (st == CUPTI_SUCCESS) {
                 ingest(record);
             } else {
-                break;  /* MAX_LIMIT_REACHED = end of buffer; anything else, stop */
+                /* MAX_LIMIT_REACHED is the end of the buffer. Anything else
+                 * abandons the records after this one. */
+                failed = (st != CUPTI_ERROR_MAX_LIMIT_REACHED);
+                break;
             }
         }
     }
+    if (g_buffer_done) g_buffer_done(failed, g_buffer_user);
     pthread_mutex_unlock(&g_lock);
     free(buffer);  /* posix_memalign's pointer — free() takes it directly */
 }
